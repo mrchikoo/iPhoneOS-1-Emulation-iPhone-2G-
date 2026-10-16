@@ -1,0 +1,18 @@
+# Downloaded third-party content (fetch with scripts/fetch.py) - never commit
+/mirror/*
+!/mirror/serve.py
+/re-core/emu.wasm
+/re-trace/rootfs.img
+/re-trace/cold*/
+/re-trace/test1/
+/re-trace/fw_extract/
+/re-disasm/input/
+/re-disasm/out/
+/re-disasm/venv/
+/patch/out/
+*.macho
+*.img
+*.snap*
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
