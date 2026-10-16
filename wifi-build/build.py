@@ -149,10 +149,24 @@ def build_js(patch, h, wasm_name):
     a = once(a, "  const workerURL = new URL('./emu-worker.js', import.meta.url);\n",
              "  const workerURL = new URL('./emu-worker.js', import.meta.url);\n"
              "  workerURL.searchParams.set('v', '%s');\n" % h, "app worker version")
+    # keyboard.js: Mac keyboard -> taps on the guest's on-screen keyboard (ES module, no deps)
+    a = once(a, "const contacts = new Map(), keys = new Map(), pending = new Map();\n",
+             "import {initKeyboard} from './keyboard.js?v=%s';\n" % sha(os.path.join(HERE, "keyboard.js"))[:12] +
+             "const contacts = new Map(), keys = new Map(), pending = new Map();\n", "app keyboard import")
+    a = once(a, "canvas.addEventListener('pointerdown', event => {\n  if (!ready || paused ||",
+             "initKeyboard({canvas, context, setStatus, status:$('status'),\n"
+             "  isReady: () => ready && !paused,\n"
+             "  send: list => call('contacts', {contacts:list}).catch(inputError),\n"
+             "  others: () => [...contacts.values()], touched: () => { lastInput = performance.now(); }});\n"
+             "canvas.addEventListener('pointerdown', event => {\n  if (!ready || paused ||", "app keyboard init")
     write(os.path.join(BUILD, "app.js"), a)
+    shutil.copy2(os.path.join(HERE, "keyboard.js"), os.path.join(BUILD, "keyboard.js"))
 
     idx = once(read(os.path.join(MIRROR, "index.html")), '<script type="module" src="app.js"></script>',
                '<script type="module" src="app.js?v=%s"></script>' % h, "index app.js")
+    idx = once(idx, '<footer class="site-footer">Made by <a href="https://kelindi.ca">Kelindi</a></footer>',
+               '<footer class="site-footer">Made by <a href="https://kelindi.ca">Kelindi</a> &middot; '
+               'Wi-Fi and browser support by <a href="https://shazil-katchhi.vercel.app">mrchikoo</a></footer>', "index footer")
     write(os.path.join(BUILD, "index.html"), idx)
     write(os.path.join(BUILD, "service-worker.js"), SW)
 
@@ -166,7 +180,7 @@ def build_js(patch, h, wasm_name):
 
 
 # ------------------------------------------------------------------ 4. site overlay
-OWN = {"app.js", "emu-worker.js", "index.html", "manifest.json", "service-worker.js", "dist", "fw"}
+OWN = {"app.js", "keyboard.js", "emu-worker.js", "index.html", "manifest.json", "service-worker.js", "dist", "fw"}
 
 
 def build_site(wasm_name):
@@ -178,7 +192,7 @@ def build_site(wasm_name):
             os.symlink(os.path.join(MIRROR, name), os.path.join(SITE, name))
     for name in sorted(os.listdir(os.path.join(MIRROR, "fw"))):
         os.symlink(os.path.join(MIRROR, "fw", name), os.path.join(SITE, "fw", name))
-    for name in ("app.js", "emu-worker.js", "index.html", "manifest.json", "service-worker.js",
+    for name in ("app.js", "keyboard.js", "emu-worker.js", "index.html", "manifest.json", "service-worker.js",
                  "dist/emu.js", "fw/devicetree_m68ap_wifi.bin"):
         os.symlink(os.path.join(BUILD, name), os.path.join(SITE, name))
     os.symlink(os.path.join(BUILD, "emu-net.wasm"), os.path.join(SITE, "dist", wasm_name))

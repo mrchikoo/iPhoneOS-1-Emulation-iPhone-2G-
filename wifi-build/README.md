@@ -7,7 +7,7 @@ Nothing outside this directory is modified; inputs are copied (`vendor/`) or sym
 ## Commands
 
 ```sh
-cd "wifi-build"
+cd "/Users/skkat/Untitled Folder/wifi-build"
 ./build.sh          # = python3 build.py  -> vendor/, build/, site/   (needs python3 + wabt: wasm2wat, wat2wasm, wasm-validate)
 ./run.sh            # relay on ws://127.0.0.1:8008 (log: relay.log) + server on http://localhost:8200 ; Ctrl-C stops both
 #   ./run.sh --host mysite.test=10.0.2.2   extra args go to relay.py
@@ -66,6 +66,33 @@ Console helpers: `window.iphoneNet` (connected/tx/rx/config/trace), `window.cold
   worked with it. `?jit=0` forces the interpreter; that also works end to end.
 * Console: no errors during the runs, except `WebSocket connection to 'ws://localhost:8008/' failed` while the relay was
   stopped (expected; the bridge reconnects with backoff, frames are dropped while disconnected).
+
+## Keyboard
+
+`keyboard.js` (ES module, no dependencies; wired in by `build.py`, which imports it from `app.js` and calls
+`initKeyboard(...)`) lets you type on your Mac keyboard. The emulator has no keyboard device, so each keystroke is
+turned into one or two taps (contact down, 50 ms, contact up, queued with a 110 ms gap) on the guest's own
+on-screen keyboard, switching between its letter / number / symbol layouts and using shift as needed.
+
+- Typing mode is automatic: when the phone shows its keyboard (detected by comparing a 40x25 grayscale signature of
+  the y=276..475 band of the 320x480 canvas with reference captures) Mac keys are typed into the phone.
+  `Tab` forces typing mode on (or off while typing), `Esc` leaves it (re-arms when the keyboard goes away).
+  While typing, H / P / M / + / - / Esc do not fire phone buttons. Status line under the phone shows the state.
+- Supported: letters (shift tapped for capitals), digits, punctuation (123 / symbol layouts and back), space,
+  Backspace/Delete, Enter (Go / Return / Search). Handles both the Safari URL keyboard (`. / .com`, no space key)
+  and the plain keyboard (space + Return); the layout and shift state are read back from the screen before each key.
+- Not typable: keys the guest keyboard lacks (URL keyboard: space and any symbol outside its number/symbol pages;
+  plain keyboard: backtick; euro/pound/yen/bullet are not mapped), arrow keys; Cmd/Ctrl combos are left to the browser.
+- Console helper: `iphoneKeyboard.type('http://web.test:8090\n')`, `iphoneKeyboard.state()`.
+- Tested in the built-in browser (screenshots `shots/kb-*.png`): `http://web.test:8090` + Enter on the Safari URL
+  bar loaded the proxy page (`kb-10-loaded.png`); uppercase, digits, backspace (`kb-5`, `kb-6`), space and
+  punctuation in the Safari search field (`kb-7`, `kb-8`).
+- Caveats: ~0.15 s per character (the guest redraws slowly); one swapped letter (l typed as k) was seen once in
+  ~120 characters before the gap was raised from 90 to 110 ms (not re-measured); keys typed while the "Repair Needed"
+  alert or any other overlay covers the keyboard are dropped (dismiss the alert first); guest autocorrect still
+  applies (e.g. a "LOL" suggestion for `lll`); reference signatures are only valid for the portrait OS 1 keyboards
+  measured here (Safari URL + search field); other apps' keyboards that match one of them work, anything else is
+  treated as "no keyboard" (use Tab to force, but the layout then cannot be read).
 
 ## Known issues / honest notes
 * The first tap on Settings right after "SpringBoard after Ns" was ignored once; a second tap worked.
