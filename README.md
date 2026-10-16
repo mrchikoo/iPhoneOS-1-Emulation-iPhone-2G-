@@ -25,15 +25,22 @@ contains only original tooling and notes. Check licensing before redistributing 
 | `re-core/` | `dt.py` device-tree dumper (`emu.wasm` fetched here) |
 | `re-disasm/scripts/` | Mach-O / kernel-image / vtable helpers (capstone venv not included) |
 | `re-trace/` | `run.mjs` headless cold-boot harness with SDIO tracing |
-| `dt-patch/` | device-tree patcher for WiFi properties (untested in browser) |
+| `dt-patch/` | device-tree patcher (WiFi properties) and `?cold=1` notes |
 | `patch/` | `patch.py` + `net_funcs.wat`: adds SDIO window and packet rings to `emu.wasm`; tests |
 | `wifi-design/` | `relay.py` host-side Ethernet relay (DHCP/DNS/ARP/NAT), `test_relay.py` |
 | `docs/` | emulator-core report, SDIO register map from the guest kernel, WiFi design |
 
 ## WiFi status
-Done: chip identified, SDIO register map and firmware protocol recovered from the kernel, patch
-pipeline and packet bridge (boots identically), relay with passing tests.
-Not done: the SDIO host/card responses (guest times out on CMD5), interrupt 42 delivery, device-tree
-properties, end-to-end traffic. `docs/wifi-design.md` is an earlier design; where it conflicts with
-`docs/sdio-map.md`, the latter is authoritative. Several agent-written READMEs mention absolute
-paths from the original machine; commands run from the repo root work with the layout above.
+Works in the built-in browser (Chromium), per agent-run tests with screenshots (not committed):
+cold boot with the patched core + Wi-Fi device tree -> Settings > Wi-Fi lists "LocalNet" -> join ->
+DHCP (10.0.2.15) -> Safari loads http pages through `relay.py` (local server and http://example.com).
+
+```sh
+python3 scripts/fetch.py
+cd wifi-build && ./build.sh && ./run.sh      # needs wabt; then open http://localhost:8200/?cold=1
+```
+Known limits: `?cold=1` required (the stock snapshot predates Wi-Fi; no saving in cold mode); the
+"Repair Needed" (no baseband) alert reappears; https sites fail (2007-era TLS); only one open AP,
+no WPA/WEP/power-save; relay is IPv4-only with no out-of-order buffering or congestion window;
+tested only in Chromium. See `docs/` and `tcp-test/RESULTS.md` for evidence and details.
+`docs/wifi-design.md` is an early design; `docs/sdio-map.md` (from the guest kernel) is authoritative.

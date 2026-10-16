@@ -15,9 +15,11 @@ message, no FCS).  The relay acts as a slirp-style user-mode router:
 Traffic to the gateway address 10.0.2.2 is redirected to 127.0.0.1 on the
 host (QEMU slirp convention), so the guest can reach a local web server.
 
-Limitations (see DESIGN.md): IPv4 only, no IP fragment reassembly, no
-guest-bound TCP retransmission (the WS link is reliable), no TCP persist
-timer, ICMP to the internet unsupported.
+Guest-bound TCP is a real sender: it honours the guest's window, retransmits
+(RTO + fast retransmit), probes zero windows and tracks FIN (see TcpConn).
+Limitations: IPv4 only, no IP fragment reassembly, no window scaling / SACK
+offered, no out-of-order buffering of guest data, ICMP to the internet
+unsupported.
 """
 import argparse
 import asyncio
@@ -143,27 +145,86 @@ def dns_answer(msg, question_raw, qtype, addr):
 
 
 # ------------------------------------------------------------------ TCP
+def tcp_options(raw_opts):
+    """Return (mss or None, wscale or None, sack_permitted) from a TCP option block."""
+    mss = ws = None
+    sack = False
+    i = 0
+    while i < len(raw_opts):
+        k = raw_opts[i]
+        if k == 0:
+            break
+        if k == 1:
+            i += 1
+            continue
+        if i + 1 >= len(raw_opts) or raw_opts[i + 1] < 2:
+            break
+        n = raw_opts[i + 1]
+        body = raw_opts[i + 2:i + n]
+        if k == 2 and len(body) == 2:
+            mss = struct.unpack("!H", body)[0]
+        elif k == 3 and len(body) == 1:
+            ws = body[0]
+        elif k == 4:
+            sack = True
+        i += n
+    return mss, ws, sack
+
+
 class TcpConn:
-    def __init__(self, gw, key, gmac, gip, sport, dst_ip, dport, isn, win):
+    """One guest TCP connection terminated here and re-originated on the host.
+
+    Guest-bound data is kept in `buf` until the guest ACKs it (sequence numbers
+    are relative to our ISN: SYN = 0, first data byte = 1).  Sending honours
+    the guest's advertised window, retransmits on RTO (go-back-N with backoff)
+    and on 3 duplicate ACKs, and probes a zero window.  We do not offer window
+    scaling or SACK, so the guest's window is the plain 16-bit field.
+    """
+    RTO0, RTO_MAX, MAX_RETRIES = 0.4, 6.0, 12
+    BUF_CAP = 256 * 1024
+    FLIGHT_CAP = 16 * MSS            # keep bursts below the card's RX ring
+
+    def __init__(self, gw, key, gmac, gip, sport, dst_ip, dport, isn, win, opts=b""):
         self.gw, self.key, self.gmac, self.gip = gw, key, gmac, gip
         self.sport, self.dst_ip, self.dport = sport, dst_ip, dport
+        self.irs = isn
         self.rcv_next = (isn + 1) & M32      # next seq expected from guest
         self.isn = int.from_bytes(os.urandom(4), "big")
-        self.sent = 1                        # SYN consumes one (relative)
-        self.acked = 0
-        self.gwin = max(win, 1)
+        peer_mss, _ws, _sack = tcp_options(opts)
+        self.mss = max(64, min(MSS, peer_mss or 536))
+        self.una = 0                         # oldest unacked (relative)
+        self.nxt = 0                         # next to send
+        self.smax = 0                        # highest ever sent
+        self.buf = bytearray()               # data from relative seq buf_base
+        self.buf_base = 1
+        self.eof = False                     # host side closed (FIN queued)
+        self.fin_sent = self.fin_rcvd = False
+        self.gwin = max(win, 0)
+        self.dup = 0
+        self.rto, self.retries = self.RTO0, 0
+        self.timer = None
         self.reader = self.writer = None
         self.state = "connecting"
-        self.fin_sent = self.fin_rcvd = False
-        self.ack_ev = asyncio.Event()
-        self.tasks = []
-        self.tasks.append(asyncio.ensure_future(self._connect()))
+        self.space_ev = asyncio.Event()
+        self.tasks = [asyncio.ensure_future(self._connect())]
+        self.stats = dict(retx=0, fast=0, probes=0, sent=0, zero_win=0)
 
     # -- output
+    @property
+    def end(self):                           # relative seq just past queued data
+        return self.buf_base + len(self.buf)
+
+    def _adv_win(self):
+        try:
+            used = self.writer.transport.get_write_buffer_size()
+        except Exception:
+            used = 0
+        return max(0, 65535 - used)
+
     def _emit(self, seq_rel, flags, data=b"", mss=False, ack=True):
         seg = tcp_segment(self.dst_ip, self.gip, self.dport, self.sport,
                           self.isn + seq_rel, self.rcv_next,
-                          flags | (ACK if ack else 0), 65535, data, mss)
+                          flags | (ACK if ack else 0), self._adv_win(), data, mss)
         self.gw.send_ip(self.gmac, self.dst_ip, self.gip, 6, seg)
 
     async def _connect(self):
@@ -177,30 +238,105 @@ class TcpConn:
             self.gw.tcp.pop(self.key, None)
             return
         self.state = "established"
-        self._emit(0, SYN, mss=True)
+        self._emit(0, SYN, mss=True)         # SYN-ACK
+        self.nxt = self.smax = 1
+        self._arm()
         self.tasks.append(asyncio.ensure_future(self._pump()))
 
     async def _pump(self):
         try:
             while True:
-                data = await self.reader.read(MSS)
-                if not data:
-                    break
-                while self.sent - self.acked >= self.gwin:
-                    self.ack_ev.clear()
-                    await self.ack_ev.wait()
+                while len(self.buf) >= self.BUF_CAP:
+                    self.space_ev.clear()
+                    await self.space_ev.wait()
                     if self.state == "closed":
                         return
-                self._emit(self.sent, PSH, data)
-                self.sent += len(data)
+                data = await self.reader.read(MSS * 8)
+                if not data:
+                    break
+                self.buf += data
+                self._output()
         except (ConnectionError, OSError):
-            self._emit(self.sent, RST)
+            self._emit(self.nxt, RST)
             self.close()
             return
-        self._emit(self.sent, FIN)
-        self.sent += 1
-        self.fin_sent = True
-        self._maybe_done()
+        self.eof = True
+        self._output()
+
+    def _output(self):
+        """Send as much queued data (and the FIN) as the guest window allows."""
+        if self.state != "established":
+            return
+        limit = min(max(self.gwin, 0), self.FLIGHT_CAP)
+        while True:
+            room = limit - (self.nxt - self.una)
+            pend = self.end - self.nxt
+            if pend > 0:
+                n = min(self.mss, room, pend)
+                if n <= 0:
+                    break
+                off = self.nxt - self.buf_base
+                last = n == pend
+                self._emit(self.nxt, PSH if last else 0, bytes(self.buf[off:off + n]))
+                self.nxt += n
+            elif self.eof and not self.fin_sent and self.nxt == self.end and room > 0:
+                self._emit(self.nxt, FIN)
+                self.nxt += 1
+                self.fin_sent = True
+            elif self.eof and self.fin_sent and self.nxt == self.end and self.nxt <= self.smax:
+                # go-back-N reached the FIN again: re-send it
+                if room <= 0:
+                    break
+                self._emit(self.nxt, FIN)
+                self.nxt += 1
+            else:
+                break
+            self.smax = max(self.smax, self.nxt)
+            self.stats["sent"] += 1
+        self._arm()
+
+    def _flight(self):
+        return self.smax > self.una
+
+    def _arm(self):
+        want = self._flight() or (self.end > self.una and self.state == "established") \
+            or (self.eof and not self.fin_acked())
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+        if want and self.state == "established":
+            self.timer = asyncio.get_event_loop().call_later(self.rto, self._on_timer)
+
+    def fin_acked(self):
+        return self.fin_sent and self.una > self.end
+
+    def _on_timer(self):
+        self.timer = None
+        if self.state != "established":
+            return
+        if self.una == 0:                       # SYN-ACK unacknowledged
+            self._emit(0, SYN, mss=True)
+            self.stats["retx"] += 1
+        elif self.gwin == 0 and self.nxt == self.una and self.end > self.una:
+            # zero-window probe: one byte beyond the window
+            off = self.una - self.buf_base
+            self._emit(self.una, 0, bytes(self.buf[off:off + 1]))
+            self.nxt = self.una + 1
+            self.smax = max(self.smax, self.nxt)
+            self.stats["probes"] += 1
+        else:
+            self.retries += 1
+            if self.retries > self.MAX_RETRIES:
+                self._emit(self.nxt, RST)
+                self.close()
+                return
+            self.stats["retx"] += 1
+            self.nxt = self.una
+            if self.fin_sent and self.una <= self.end:
+                pass                            # FIN will be re-sent by _output
+            self._output()
+        self.rto = min(self.rto * 2, self.RTO_MAX)
+        self._arm()
 
     # -- input
     def on_segment(self, seq, ack, flags, win, data):
@@ -209,12 +345,34 @@ class TcpConn:
             return
         if self.state != "established":
             return
+        if flags & SYN:                         # guest re-sent its SYN: re-send SYN-ACK
+            self._emit(0, SYN, mss=True)
+            return
         if flags & ACK:
             rel = (ack - self.isn) & M32
-            if self.acked < rel <= self.sent:
-                self.acked = rel
-            self.gwin = max(win, 1)
-            self.ack_ev.set()
+            if rel > 0x7FFFFFFF:
+                rel = 0
+            if self.una < rel <= self.smax:
+                adv = rel - self.una
+                self.una = rel
+                self.dup = 0
+                self.rto, self.retries = self.RTO0, 0
+                drop = min(len(self.buf), max(0, rel - self.buf_base))
+                if drop:
+                    del self.buf[:drop]
+                    self.buf_base += drop
+                    self.space_ev.set()
+                if self.nxt < self.una:         # ACK passed a go-back-N rewind
+                    self.nxt = self.una
+            elif rel == self.una and not data and not flags & (FIN | SYN) \
+                    and win == self.gwin and self._flight():
+                self.dup += 1
+                if self.dup == 3:               # fast retransmit
+                    self.stats["fast"] += 1
+                    self.nxt = self.una
+            if win == 0 and self.gwin != 0:
+                self.stats["zero_win"] += 1
+            self.gwin = win
         need_ack = False
         if data or flags & FIN:
             need_ack = True
@@ -236,25 +394,31 @@ class TcpConn:
                         self.writer.write_eof()
                     except Exception:
                         pass
+        self._output()
         if need_ack:
-            self._emit(self.sent, 0)
+            self._emit(self.nxt, 0)
         self._maybe_done()
 
     def _maybe_done(self):
-        if self.fin_sent and self.fin_rcvd and self.acked >= self.sent:
+        if self.fin_acked() and self.fin_rcvd:
             self.close()
 
     def close(self):
         if self.state == "closed":
             return
         self.state = "closed"
-        self.ack_ev.set()
+        if self.timer:
+            self.timer.cancel()
+        self.space_ev.set()
         self.gw.tcp.pop(self.key, None)
         for t in self.tasks:
             if t is not asyncio.current_task():
                 t.cancel()
         if self.writer:
             self.writer.close()
+        if os.environ.get("RELAY_DEBUG"):
+            import sys
+            print("tcp close %s:%d->%s:%d %s" % (self.gip, self.sport, self.dst_ip, self.dport, self.stats), file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------------------- Gateway
@@ -468,7 +632,7 @@ class Gateway:
         if c is None:
             if flags & SYN and not flags & (ACK | RST):
                 self.tcp[key] = TcpConn(self, key, gmac, ip["src"], sport,
-                                        ip["dst"], dport, seq, win)
+                                        ip["dst"], dport, seq, win, s[20:off])
             elif not flags & RST:
                 rseq, rack, rf = (ack, 0, RST) if flags & ACK else (
                     0, (seq + len(data) + (1 if flags & (SYN | FIN) else 0)) & M32, RST | ACK)

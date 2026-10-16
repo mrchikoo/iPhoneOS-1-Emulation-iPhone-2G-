@@ -1,0 +1,63 @@
+wait 2250
+tap 277 232
+wait 250
+tap 160 140
+wait 300
+tap 100 185
+wait 600
+shot hs_joined
+home
+wait 100
+tap 205 425
+wait 300
+tap 288 42
+wait 100
+tap 160 56
+wait 150
+tap 192 350
+wait 15
+tap 144 297
+wait 15
+tap 144 297
+wait 15
+tap 303 297
+wait 15
+tap 65 350
+wait 15
+tap 45 457
+wait 15
+tap 137 402
+wait 15
+tap 160 457
+wait 15
+tap 160 457
+wait 15
+tap 45 457
+wait 15
+tap 80 297
+wait 15
+tap 97 402
+wait 15
+tap 34 350
+wait 15
+tap 256 402
+wait 15
+tap 303 297
+wait 15
+tap 288 350
+wait 15
+tap 80 297
+wait 15
+tap 212 457
+wait 15
+wait 100
+shot hs_typed
+tap 280 457
+wait 300
+shot hs_load1
+wait 2500
+shot hs_load2
+wait 500
+shot hs_load3
+wait 200
+quit

@@ -117,7 +117,26 @@ assert.equal(M._emu_net_tx_pop(out, 4096), 5);
 console.log('ok: TX/RX rings round-trip, order, full, oversize, wraparound');
 
 // ---- SDIO register file + trace via the same path the guest uses -------
-assert.equal(S(7), 0, 'default mode is log-only');
+assert.equal(S(7), 2, 'default mode is the SDIO/Marvell model');
+// ---- mode 2: host controller + card (no DMA here; that needs guest RAM) --
+const R = o => M._emu_net_sdio_read(o, 4) >>> 0, W = (o, v) => M._emu_net_sdio_write(o, 4, v);
+const cmd = (idx, arg, rt) => { W(0x0c, arg); W(0x08, 0x40 | idx | rt << 16); assert.equal(R(0x18) & 1, 1, 'CMDRDY');
+  W(0x08, (0x40 | idx | rt << 16 | 0x80000000) >>> 0); const d = R(0x18); assert.equal(d & 0x10, 0x10, 'done'); W(0x14, d); return R(0x20); };
+assert.equal(cmd(5, 0, 4) >>> 0, 0x90FF8000);
+cmd(5, 0x60000, 4);
+assert.equal(cmd(3, 0, 6) >>> 16, 1, 'RCA');
+cmd(7, 0x10000, 1);
+const c52r = (fn, a) => cmd(52, fn << 28 | a << 9, 5) & 0xff;
+const c52w = (fn, a, v) => cmd(52, (0x80000000 | fn << 28 | a << 9 | v) >>> 0, 5);
+assert.equal(c52r(0, 0x100) & 0xf, 7, 'FBR1 interface code');
+c52w(0, 2, 2); assert.equal(c52r(0, 3), 2, 'IOR follows IOE');
+assert.equal(c52r(1, 0x20), 0x0f, 'card status');
+assert.equal(c52r(1, 0) | c52r(1, 1) << 8 | c52r(1, 2) << 16, 0x10000, 'IO port');
+assert.equal(R(0x18) & 0x10, 0, 'done bit cleared by STAC write-back');
+W(0x38, 0xffffffff); assert.equal(R(0x38), 0);
+console.log('ok: model host regs / CMD5/3/7/52 / CCCR / FBR / fn1');
+M._emu_net_sdio_mode(0);
+M._emu_net_trace_pop(M._malloc(16 * 1024), 1024);   // drop the model test's entries
 M._emu_net_sdio_write(0x0c, 4, 0xdeadbeef);
 assert.equal(M._emu_net_sdio_read(0x0c, 4), 0, 'mode 0 reads 0 like unpatched core');
 assert.equal(M._emu_net_sdio_mode(1), 0);
@@ -134,7 +153,7 @@ assert.equal(n, 8 + 0 * 0, 'trace entries');
 const w = new Uint32Array(M.HEAPU8.buffer, tr, n * 4);
 assert.equal(w[0] >>> 31, 1); assert.equal((w[0] >>> 16) & 255, 4); assert.equal(w[0] & 0xffff, 0x0c); assert.equal(w[1] >>> 0, 0xdeadbeef);
 assert.equal(w[4] >>> 31, 0); assert.equal(w[5], 0);
-assert.equal(w[3 * 4 + 2], 4, 'seq increments');
+assert.equal(w[3 * 4 + 2] - w[2], 3, 'seq increments');
 assert.equal(M._emu_net_trace_pop(tr, 64), 0);
 // identical consecutive accesses (polling) merge into one entry with a repeat count
 for (let i = 0; i < 1000; i++) M._emu_net_sdio_read(0x18, 4);

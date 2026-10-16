@@ -1,0 +1,53 @@
+wait 2250
+tap 277 232
+wait 250
+tap 160 140
+wait 300
+tap 100 185 0.2
+wait 600
+shot w_joined
+home
+wait 100
+tap 205 425
+wait 300
+tap 288 42
+wait 100
+tap 160 56
+wait 150
+tap 45 457
+wait 100
+tap 18 297 0.2
+wait 15
+tap 303 297 0.2
+wait 15
+tap 107 457 0.2
+wait 15
+tap 303 297 0.2
+wait 15
+tap 107 457 0.2
+wait 15
+tap 48 297 0.2
+wait 15
+tap 107 457 0.2
+wait 15
+tap 48 297 0.2
+wait 15
+tap 137 402 0.2
+wait 15
+tap 240 297 0.2
+wait 15
+tap 303 297 0.2
+wait 15
+tap 272 297 0.2
+wait 15
+tap 272 297 0.2
+wait 15
+wait 100
+shot w_typed
+tap 280 457
+wait 300
+shot w_load1
+wait 1000
+shot w_load2
+wait 200
+quit

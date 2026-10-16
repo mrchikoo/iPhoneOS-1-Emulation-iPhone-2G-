@@ -39,6 +39,9 @@
         i32.const 0x3154454e
         i32.store
         local.get $p
+        i32.const 2
+        i32.store offset=44
+        local.get $p
         global.set $net_base
         i32.const 1
       else
@@ -208,6 +211,9 @@
     local.get $len
     call $ring_push
     local.tee $ok
+    ;; model mode: let the card start an upload (RxPD packet + card interrupt)
+    (if (i32.and (i32.ne (local.get $ok) (i32.const 0)) (i32.eq (i32.load offset=44 (global.get $net_base)) (i32.const 2)))
+      (then (drop (call $emu_net_card_kick))))
     i32.eqz
     if
       global.get $net_base
@@ -524,9 +530,14 @@
   ;; guest sees; write hook runs after the byte store and may update regs,
   ;; push frames via $emu_net_tx_push, pop frames via $emu_net_rx_pop, or
   ;; set the IRQ-pending word (header +36).
+  ;; mode 2 (default) = SDIO host + Marvell card model (sdio_model.wat)
   (func $sdio_read_hook (param $off i32) (param $size i32) (param $val i32) (result i32)
+    (if (i32.eq (i32.load offset=44 (global.get $net_base)) (i32.const 2))
+      (then (return (call $model_read (local.get $off) (local.get $size) (local.get $val)))))
     local.get $val)
-  (func $sdio_write_hook (param $off i32) (param $size i32) (param $val i32))
+  (func $sdio_write_hook (param $off i32) (param $size i32) (param $val i32)
+    (if (i32.eq (i32.load offset=44 (global.get $net_base)) (i32.const 2))
+      (then (call $model_write (local.get $off) (local.get $size) (local.get $val)))))
 
   ;; little-endian byte-wise load/store in the register file
   (func $regs_load (param $off i32) (param $size i32) (result i32)

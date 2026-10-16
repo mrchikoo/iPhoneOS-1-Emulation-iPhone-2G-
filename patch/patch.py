@@ -38,6 +38,8 @@ EXPORTS = [
     ("emu_net_sdio_mode", "emu_net_sdio_mode"),
     ("emu_net_sdio_read", "emu_net_sdio_read"),
     ("emu_net_sdio_write", "emu_net_sdio_write"),
+    ("emu_net_card", "emu_net_card"),
+    ("emu_net_card_kick", "emu_net_card_kick"),
 ]
 
 
@@ -75,6 +77,9 @@ def edit_func(wat, idx, old, new, what):
 
 
 # ---------------------------------------------------------------- wasm
+EXPORTS_EXTRA = []
+
+
 def patch_wat(wat):
     # sanity: malloc is func 16 / export "V" (used by $net_init)
     if '(export "V" (func 16))' not in wat:
@@ -113,15 +118,33 @@ def patch_wat(wat):
     wat = edit_func(wat, 87, last, last + entry, "func87 overlap entry")
     # --- new functions: before the table (after the last original func) --
     funcs = open(os.path.join(HERE, "net_funcs.wat")).read()
+    model = open(os.path.join(HERE, "sdio_model.wat")).read()
+    irq_path = os.path.join(HERE, "..", "re-irq", "irq_patch.wat")
+    if os.path.exists(irq_path) and not os.environ.get("NO_IRQ"):
+        irq = open(irq_path).read()
+        print("IRQ: using", os.path.abspath(irq_path))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("irq_patch", os.path.join(os.path.dirname(irq_path), "irq_patch.py"))
+        irqmod = importlib.util.module_from_spec(spec); spec.loader.exec_module(irqmod)
+        wat = irqmod.apply_func19_hook(wat)      # re-drive VIC1 RAW bit 10 every device tick
+        EXPORTS_EXTRA.append(("sdio_irq_state", "sdio_irq_state"))
+    else:
+        irq = open(os.path.join(HERE, "sdio_irq_stub.wat")).read()
+        print("IRQ: stub (no interrupt delivery)")
+    # module-level globals must follow original global 0 in the text
+    gl = re.compile(r"^  \(global \$.*\n", re.M)
+    extra_globals = "".join(gl.findall(model) + gl.findall(irq))
+    model, irq = gl.sub("", model), gl.sub("", irq)
+    funcs = funcs + "\n" + model + "\n" + irq
     wat = replace_once(wat, "  (table (;0;) 58 funcref)\n",
                        funcs + "\n  (table (;0;) 58 funcref)\n", "net funcs insertion")
     # new global must come AFTER the original global 0 (stack pointer) in the
     # text so existing `global.get 0` keep their meaning.
     wat = replace_once(wat, "  (global (;0;) (mut i32) (i32.const 5247344))\n",
                        "  (global (;0;) (mut i32) (i32.const 5247344))\n"
-                       "  (global $net_base (mut i32) (i32.const 0))\n", "net global")
+                       "  (global $net_base (mut i32) (i32.const 0))\n" + extra_globals, "net global")
     # --- b) exports: before the elem segment -----------------------------
-    exp = "".join('  (export "%s" (func $%s))\n' % (e, f) for e, f in EXPORTS)
+    exp = "".join('  (export "%s" (func $%s))\n' % (e, f) for e, f in EXPORTS + EXPORTS_EXTRA)
     m = re.search(r"^  \(elem \(;0;\)", wat, re.M)
     if not m:
         die("elem segment not found")

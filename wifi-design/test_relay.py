@@ -1,4 +1,5 @@
 import asyncio
+import os
 import struct
 import unittest
 
@@ -263,9 +264,9 @@ class Net(unittest.TestCase):
             while total < 5000:
                 s = tcp_of(await h.rx())
                 total += len(s["data"])
-                inflight_max = max(inflight_max, total - (h.gw.tcp[(sp, R.GW_IP, port)].acked - 1))
+                inflight_max = max(inflight_max, total - (h.gw.tcp[(sp, R.GW_IP, port)].una - 1))
                 h.tx(seg(2, sseq + total, R.ACK))
-            self.assertLessEqual(inflight_max, 1500 + R.MSS)
+            self.assertLessEqual(inflight_max, 1500)   # never beyond the advertised window
             for c in list(h.gw.tcp.values()):
                 c.close()
             server.close()
@@ -292,6 +293,372 @@ class Net(unittest.TestCase):
             self.assertTrue(r["flags"] & R.RST)
             self.assertEqual(r["seq"], 9)
         run(t())
+
+
+class GuestTcp:
+    """Minimal scripted guest TCP endpoint talking to a Harness."""
+
+    def __init__(self, h, port, sp=45000, isn=1000, win=65535, syn_opts=b""):
+        self.h, self.port, self.sp, self.win = h, port, sp, win
+        self.snd = isn + 1
+        self.isn, self.syn_opts = isn, syn_opts
+        self.rcv = None
+
+    def seg(self, flags, data=b"", seq=None, ack=None, win=None, opts=b""):
+        seq = self.snd if seq is None else seq
+        ack = (self.rcv or 0) if ack is None else ack
+        win = self.win if win is None else win
+        raw = R.tcp_segment(GIP, R.GW_IP, self.sp, self.port, seq, ack, flags, win, data)
+        if opts:
+            off = (20 + len(opts)) // 4
+            raw = raw[:12] + struct.pack("!H", (off << 12) | flags) + raw[14:16] + b"\0\0" + raw[18:20] + opts + data
+            raw = raw[:16] + struct.pack("!H", R.csum(R.pseudo(GIP, R.GW_IP, 6, len(raw)) + raw)) + raw[18:]
+        return self.h.ip_frame(R.GW_IP, 6, raw)
+
+    async def connect(self):
+        self.h.tx(self.seg(R.SYN, seq=self.isn, ack=0, opts=self.syn_opts))
+        sa = await self.recv()
+        assert sa["flags"] == R.SYN | R.ACK, sa["flags"]
+        self.synack = sa
+        self.rcv = sa["seq"] + 1
+        self.h.tx(self.seg(R.ACK))
+        return sa
+
+    async def recv(self, t=5, pred=None):
+        f = await self.h.rx(lambda f: ip_of(f) and ip_of(f)["proto"] == 6 and
+                            (pred is None or pred(tcp_of(f))), t)
+        return tcp_of(f)
+
+    def ack(self, win=None, ack=None):
+        self.h.tx(self.seg(R.ACK, ack=ack, win=win))
+
+    def send(self, data):
+        self.h.tx(self.seg(R.ACK | R.PSH, data))
+        self.snd += len(data)
+
+
+async def tcp_server(handler):
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1]
+
+
+class TcpStack(unittest.TestCase):
+    """Behaviour a real (BSD) TCP peer needs from the relay."""
+
+    def test_never_sends_beyond_window_even_tiny(self):
+        async def t():
+            async def srv(r, w):
+                w.write(bytes(range(256)) * 20)       # 5120 bytes
+                await w.drain()
+                await r.read()
+                w.close()
+            server, port = await tcp_server(srv)
+            h = Harness()
+            g = GuestTcp(h, port, win=60)
+            await g.connect()
+            got = b""
+            while len(got) < 5120:
+                s = await g.recv()
+                if not s["data"]:
+                    continue
+                self.assertLessEqual(len(s["data"]), 60)
+                self.assertEqual(s["seq"], g.rcv + len(got))
+                got += s["data"]
+                g.ack(ack=g.rcv + len(got))
+            self.assertEqual(got, bytes(range(256)) * 20)
+            for c in list(h.gw.tcp.values()):
+                c.close()
+            server.close()
+        run(t())
+
+    def test_window_shrink_midstream_no_overrun(self):
+        # the real-iPhone failure: window falls to 60, relay used to send a full MSS
+        async def t():
+            async def srv(r, w):
+                w.write(b"A" * 20000)
+                await w.drain()
+                await r.read()
+                w.close()
+            server, port = await tcp_server(srv)
+            h = Harness()
+            g = GuestTcp(h, port, win=3000)
+            await g.connect()
+            got = 0
+            while got < 8000:
+                s = await g.recv(pred=lambda s: s["data"])
+                self.assertEqual(s["seq"], g.rcv + got)
+                got += len(s["data"])
+                g.ack(ack=g.rcv + got, win=3000)
+            # drain whatever was already in flight under the old window, then shrink
+            while not h.out.empty():
+                s = tcp_of(h.out.get_nowait())
+                if s["data"] and s["seq"] == g.rcv + got:
+                    got += len(s["data"])
+            high = g.rcv + got                         # everything sent so far is below this
+            g.ack(ack=high, win=60)
+            new_bytes = 0
+            for _ in range(10):
+                try:
+                    p = await g.recv(t=0.3, pred=lambda s: s["data"])
+                except asyncio.TimeoutError:
+                    break
+                if p["seq"] < high:                    # old in-flight or retransmission
+                    continue
+                self.assertLessEqual(p["seq"] + len(p["data"]), high + 60)
+                self.assertLessEqual(len(p["data"]), 60)
+                if p["seq"] == g.rcv + got:
+                    got += len(p["data"])
+                    new_bytes += len(p["data"])
+            g.ack(ack=g.rcv + got, win=3000)
+            while got < 20000:
+                s = await g.recv(pred=lambda s: s["data"])
+                if s["seq"] == g.rcv + got:
+                    got += len(s["data"])
+                g.ack(ack=g.rcv + got, win=3000)
+            self.assertEqual(got, 20000)
+            for c in list(h.gw.tcp.values()):
+                c.close()
+            server.close()
+        run(t())
+
+    def test_zero_window_persist_and_resume(self):
+        async def t():
+            payload = bytes((i * 7) & 255 for i in range(6000))
+
+            async def srv(r, w):
+                w.write(payload)
+                await w.drain()
+                await r.read()
+                w.close()
+            server, port = await tcp_server(srv)
+            h = Harness()
+            g = GuestTcp(h, port, win=0)
+            await g.connect()
+            # window is zero: nothing but (at most) tiny probes may arrive
+            seen = b""
+            try:
+                while True:
+                    s = await g.recv(t=1.2)
+                    if s["data"]:
+                        self.assertLessEqual(len(s["data"]), 1)
+                        seen += s["data"]
+                        g.ack(win=0, ack=g.rcv)
+            except asyncio.TimeoutError:
+                pass
+            conn = next(iter(h.gw.tcp.values()))
+            self.assertGreaterEqual(conn.stats["probes"], 1)
+            # reopen the window: the whole payload must follow byte-exact from seq rcv
+            got = b""
+            g.ack(win=4000, ack=g.rcv)
+            while len(got) < len(payload):
+                s = await g.recv(t=3)
+                if not s["data"]:
+                    continue
+                if s["seq"] != g.rcv + len(got):          # probe byte / retransmission
+                    g.ack(win=4000, ack=g.rcv + len(got))
+                    continue
+                got += s["data"]
+                g.ack(win=4000, ack=g.rcv + len(got))
+            self.assertEqual(got, payload)
+            for c in list(h.gw.tcp.values()):
+                c.close()
+            server.close()
+        run(t())
+
+    def test_rto_retransmit_after_loss(self):
+        async def t():
+            async def srv(r, w):
+                w.write(b"hello world")
+                await w.drain()
+                await r.read()
+                w.close()
+            server, port = await tcp_server(srv)
+            h = Harness()
+            g = GuestTcp(h, port)
+            await g.connect()
+            first = await g.recv(pred=lambda s: s["data"])
+            t0 = asyncio.get_running_loop().time()
+            again = await g.recv(t=3, pred=lambda s: s["data"])      # never ACKed -> RTO
+            self.assertEqual(again["seq"], first["seq"])
+            self.assertEqual(again["data"], b"hello world")
+            self.assertGreater(asyncio.get_running_loop().time() - t0, 0.2)
+            g.ack(ack=g.rcv + 11)
+            conn = next(iter(h.gw.tcp.values()))
+            self.assertGreaterEqual(conn.stats["retx"], 1)
+            for c in list(h.gw.tcp.values()):
+                c.close()
+            server.close()
+        run(t())
+
+    def test_fast_retransmit_on_three_dupacks(self):
+        async def t():
+            async def srv(r, w):
+                w.write(b"B" * (R.MSS * 4))
+                await w.drain()
+                await r.read()
+                w.close()
+            server, port = await tcp_server(srv)
+            h = Harness()
+            g = GuestTcp(h, port)
+            await g.connect()
+            segs = []
+            while len(segs) < 4:
+                s = await g.recv(pred=lambda s: s["data"])
+                segs.append(s)
+            # guest lost segment 0 (never delivered): dup-ACK rcv three times
+            for _ in range(3):
+                g.ack(ack=g.rcv)
+            r = await g.recv(t=0.3, pred=lambda s: s["data"] and s["seq"] == segs[0]["seq"])
+            self.assertEqual(r["data"], segs[0]["data"])
+            self.assertEqual(next(iter(h.gw.tcp.values())).stats["fast"], 1)
+            for c in list(h.gw.tcp.values()):
+                c.close()
+            server.close()
+        run(t())
+
+    def test_lossy_bulk_transfer_is_byte_exact(self):
+        async def t():
+            payload = os.urandom(200000)
+
+            async def srv(r, w):
+                w.write(payload)
+                await w.drain()
+                await r.read()
+                w.close()
+            server, port = await tcp_server(srv)
+            h = Harness()
+            g = GuestTcp(h, port, win=16384)
+            await g.connect()
+            got, n = b"", 0
+            deadline = asyncio.get_running_loop().time() + 12
+            while len(got) < len(payload) and asyncio.get_running_loop().time() < deadline:
+                try:
+                    s = await g.recv(t=1)
+                except asyncio.TimeoutError:
+                    continue
+                if not s["data"]:
+                    continue
+                n += 1
+                if n % 7 == 0:                # lose every 7th segment on the way to the guest
+                    continue
+                if s["seq"] == g.rcv + len(got):
+                    got += s["data"]
+                g.ack(ack=g.rcv + len(got), win=16384)
+            self.assertEqual(len(got), len(payload))
+            self.assertEqual(got, payload)
+            for c in list(h.gw.tcp.values()):
+                c.close()
+            server.close()
+        run(t())
+
+    def test_syn_retransmit_gets_synack_again(self):
+        async def t():
+            async def srv(r, w):
+                await r.read()
+                w.close()
+            server, port = await tcp_server(srv)
+            h = Harness()
+            g = GuestTcp(h, port)
+            sa1 = await _first_synack(g)
+            h.tx(g.seg(R.SYN, seq=g.isn, ack=0))        # guest never got the SYN-ACK
+            sa2 = await g.recv()
+            self.assertEqual(sa2["flags"], R.SYN | R.ACK)
+            self.assertEqual(sa2["seq"], sa1["seq"])    # same ISN, no new connection
+            self.assertEqual(len(h.gw.tcp), 1)
+            for c in list(h.gw.tcp.values()):
+                c.close()
+            server.close()
+        run(t())
+
+    def test_mss_option_respected_and_no_window_scale_offered(self):
+        async def t():
+            async def srv(r, w):
+                w.write(b"M" * 3000)
+                await w.drain()
+                await r.read()
+                w.close()
+            server, port = await tcp_server(srv)
+            h = Harness()
+            # MSS 536, NOP, WS 7, SACK-permitted, NOP NOP
+            opts = bytes([2, 4, 0x02, 0x18, 1, 3, 3, 7, 4, 2, 1, 1])
+            g = GuestTcp(h, port, syn_opts=opts)
+            h.tx(g.seg(R.SYN, seq=g.isn, ack=0, opts=opts))
+            sa = await g.recv()
+            raw = sa["raw"]
+            ho = raw[20:(raw[12] >> 4) * 4]
+            self.assertNotIn(bytes([3, 3]), ho)          # no window scale in SYN-ACK
+            self.assertNotIn(bytes([4, 2]), ho)          # no SACK-permitted either
+            g.rcv = sa["seq"] + 1
+            g.ack()
+            got = 0
+            while got < 3000:
+                s = await g.recv(pred=lambda s: s["data"])
+                self.assertLessEqual(len(s["data"]), 536)
+                got += len(s["data"])
+                g.ack(ack=g.rcv + got)
+            for c in list(h.gw.tcp.values()):
+                c.close()
+            server.close()
+        run(t())
+
+    def test_fin_after_data_is_ordered_and_retransmitted(self):
+        async def t():
+            async def srv(r, w):
+                w.write(b"tail-data")
+                await w.drain()
+                w.close()                       # host closes: FIN must follow the data
+            server, port = await tcp_server(srv)
+            h = Harness()
+            g = GuestTcp(h, port)
+            await g.connect()
+            d = await g.recv(pred=lambda s: s["data"])
+            f1 = await g.recv(pred=lambda s: s["flags"] & R.FIN)
+            self.assertEqual(f1["seq"], d["seq"] + len(d["data"]))
+            # no ACK -> FIN is retransmitted (data too, go-back-N)
+            f2 = await g.recv(t=3, pred=lambda s: s["flags"] & R.FIN)
+            self.assertEqual(f2["seq"], f1["seq"])
+            g.ack(ack=f1["seq"] + 1)
+            h.tx(g.seg(R.FIN | R.ACK, ack=f1["seq"] + 1))
+            g.snd += 1
+            last = await g.recv(pred=lambda s: s["ack"] == g.snd)
+            for _ in range(40):
+                if not h.gw.tcp:
+                    break
+                await asyncio.sleep(0.05)
+            self.assertFalse(h.gw.tcp)
+            server.close()
+        run(t())
+
+    def test_guest_retransmitted_data_delivered_once(self):
+        async def t():
+            got = []
+
+            async def srv(r, w):
+                got.append(await r.read())
+                w.close()
+            server, port = await tcp_server(srv)
+            h = Harness()
+            g = GuestTcp(h, port)
+            await g.connect()
+            h.tx(g.seg(R.ACK | R.PSH, b"abcdef"))
+            h.tx(g.seg(R.ACK | R.PSH, b"abcdef"))              # exact duplicate
+            h.tx(g.seg(R.ACK | R.PSH, b"defghi", seq=g.snd + 3))   # overlapping retransmit
+            g.snd += 9
+            h.tx(g.seg(R.FIN | R.ACK))
+            for _ in range(40):
+                if got:
+                    break
+                await asyncio.sleep(0.05)
+            self.assertEqual(got, [b"abcdefghi"])
+            for c in list(h.gw.tcp.values()):
+                c.close()
+            server.close()
+        run(t())
+
+
+async def _first_synack(g):
+    g.h.tx(g.seg(R.SYN, seq=g.isn, ack=0))
+    return await g.recv()
 
 
 class WebSocket(unittest.TestCase):
