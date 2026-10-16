@@ -44,3 +44,10 @@ Known limits: `?cold=1` required (the stock snapshot predates Wi-Fi; no saving i
 no WPA/WEP/power-save; relay is IPv4-only with no out-of-order buffering or congestion window;
 tested only in Chromium. See `docs/` and `tcp-test/RESULTS.md` for evidence and details.
 `docs/wifi-design.md` is an early design; `docs/sdio-map.md` (from the guest kernel) is authoritative.
+
+## Browsing the modern web from the phone
+OS 1.0 Safari can't do modern TLS/HTML. `browser/proxy.py` (started by `wifi-build/run.sh`) is a
+stripped-down host-side proxy: it fetches pages with the Mac's own `curl` and certificate store,
+reduces them to plain HTML, converts images to small JPEGs, and serves plain HTTP. In the phone's
+Safari open `http://web.test:8090/` (or `http://10.0.2.2:8090/`), then type a URL or a search.
+No JavaScript/CSS, POST forms are sent as GET, no logins/cookies. It listens on 127.0.0.1 only.
