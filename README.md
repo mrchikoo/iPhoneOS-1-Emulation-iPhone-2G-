@@ -1,6 +1,6 @@
 # iphone-os1-local
 
-Run the browser-based iPhone OS 1.0 emulator from [2007.mobile](https://2007.mobile/)
+Run the browser-based iPhone OS 1.0 emulator
 locally, plus reverse-engineering notes and a work-in-progress WiFi (SDIO / Marvell 88W8686) patch.
 
 **Status:** the local mirror boots to the lock screen. **WiFi does not work yet** (see below).
